@@ -1,5 +1,47 @@
-use crate::claude_cli::{build_prompt, map_model};
-use crate::types::{Message, MessageContent, MessagesRequest};
+use serde_json::json;
+
+use crate::claude_cli::{build_prompt, build_stdin, map_model};
+use crate::types::{ContentBlock, Message, MessageContent, MessagesRequest};
+
+/// The prompt's text, asserting it is a single text block.
+fn prompt_text(req: &MessagesRequest) -> String {
+    match build_prompt(req).as_slice() {
+        [ContentBlock::Text { text }] => text.clone(),
+        other => panic!("expected one text block, got {other:?}"),
+    }
+}
+
+fn image(data: &str) -> ContentBlock {
+    ContentBlock::Image {
+        source: json!({"type": "base64", "media_type": "image/jpeg", "data": data}),
+    }
+}
+
+fn image_json(data: &str) -> serde_json::Value {
+    json!({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": data}})
+}
+
+fn text(s: &str) -> ContentBlock {
+    ContentBlock::Text {
+        text: s.to_string(),
+    }
+}
+
+fn message(role: &str, blocks: Vec<ContentBlock>) -> Message {
+    Message {
+        role: role.to_string(),
+        content: MessageContent::Blocks(blocks),
+    }
+}
+
+fn request(messages: Vec<Message>) -> MessagesRequest {
+    MessagesRequest {
+        model: "claude-opus-4-6".to_string(),
+        messages,
+        system: None,
+        stream: true,
+    }
+}
 
 #[test]
 fn map_model_opus() {
@@ -37,7 +79,7 @@ fn build_prompt_simple_message() {
         stream: true,
     };
 
-    let prompt = build_prompt(&req);
+    let prompt = prompt_text(&req);
     assert_eq!(prompt, "Human: Hello!");
 }
 
@@ -53,7 +95,7 @@ fn build_prompt_with_system_string() {
         stream: true,
     };
 
-    let prompt = build_prompt(&req);
+    let prompt = prompt_text(&req);
     assert!(prompt.starts_with("Be helpful."));
     assert!(prompt.contains("Human: Hi"));
 }
@@ -73,7 +115,7 @@ fn build_prompt_with_system_blocks() {
         stream: true,
     };
 
-    let prompt = build_prompt(&req);
+    let prompt = prompt_text(&req);
     assert!(prompt.starts_with("Block one\nBlock two"));
 }
 
@@ -99,10 +141,77 @@ fn build_prompt_multi_turn() {
         stream: true,
     };
 
-    let prompt = build_prompt(&req);
+    let prompt = prompt_text(&req);
     assert!(prompt.contains("Human: Hello"));
     assert!(prompt.contains("Assistant: Hi there!"));
     assert!(prompt.contains("Human: How are you?"));
+}
+
+#[test]
+fn build_prompt_keeps_images_in_order() {
+    let req = request(vec![message(
+        "user",
+        vec![image("A"), image("B"), text("Which numbers?")],
+    )]);
+
+    let content = serde_json::to_value(build_prompt(&req)).unwrap();
+    assert_eq!(
+        content,
+        json!([
+            {"type": "text", "text": "Human: "},
+            image_json("A"),
+            image_json("B"),
+            {"type": "text", "text": "Which numbers?"},
+        ])
+    );
+}
+
+#[test]
+fn build_prompt_keeps_images_in_place_across_turns() {
+    let req = request(vec![
+        message("user", vec![image("A"), text("first")]),
+        message("assistant", vec![text("ok")]),
+        message("user", vec![text("and"), image("B")]),
+    ]);
+
+    let content = serde_json::to_value(build_prompt(&req)).unwrap();
+    assert_eq!(
+        content,
+        json!([
+            {"type": "text", "text": "Human: "},
+            image_json("A"),
+            {"type": "text", "text": "first\n\nAssistant: ok\n\nHuman: and"},
+            image_json("B"),
+        ])
+    );
+}
+
+#[test]
+fn build_prompt_keeps_image_only_message() {
+    let req = request(vec![message("user", vec![image("A")])]);
+
+    let content = serde_json::to_value(build_prompt(&req)).unwrap();
+    assert_eq!(
+        content,
+        json!([{"type": "text", "text": "Human: "}, image_json("A")])
+    );
+}
+
+#[test]
+fn build_stdin_is_one_stream_json_user_message() {
+    let req = request(vec![message("user", vec![image("A"), text("Hi")])]);
+
+    let line = build_stdin(&req);
+    assert!(line.ends_with('\n'));
+    assert_eq!(line.matches('\n').count(), 1);
+
+    let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(msg["type"], "user");
+    assert_eq!(msg["message"]["role"], "user");
+    assert_eq!(
+        msg["message"]["content"],
+        serde_json::to_value(build_prompt(&req)).unwrap()
+    );
 }
 
 #[test]

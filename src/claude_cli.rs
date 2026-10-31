@@ -4,7 +4,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use crate::error::ProxyError;
-use crate::types::{CliMessage, MessageContent, MessagesRequest};
+use crate::types::{CliMessage, ContentBlock, MessageContent, MessagesRequest};
 
 /// Resolve the claude CLI binary path.
 pub fn resolve_claude_path() -> Result<String, ProxyError> {
@@ -46,14 +46,18 @@ pub(crate) fn map_model(model: &str) -> &str {
     }
 }
 
-/// Build the prompt string from the Anthropic request.
-pub(crate) fn build_prompt(request: &MessagesRequest) -> String {
-    let mut parts = Vec::new();
+/// Build the content of the single user turn sent to the CLI.
+///
+/// The conversation is flattened into a "Human: … / Assistant: …" text
+/// transcript, but image blocks stay where they were so the CLI passes them
+/// on to the model.
+pub(crate) fn build_prompt(request: &MessagesRequest) -> Vec<ContentBlock> {
+    let mut prompt = Vec::new();
 
     // System prompt
     if let Some(ref system) = request.system {
         match system {
-            serde_json::Value::String(s) => parts.push(s.clone()),
+            serde_json::Value::String(s) => push_text(&mut prompt, "\n\n", s),
             serde_json::Value::Array(blocks) => {
                 let text: String = blocks
                     .iter()
@@ -61,7 +65,7 @@ pub(crate) fn build_prompt(request: &MessagesRequest) -> String {
                     .collect::<Vec<_>>()
                     .join("\n");
                 if !text.is_empty() {
-                    parts.push(text);
+                    push_text(&mut prompt, "\n\n", &text);
                 }
             }
             _ => {}
@@ -74,39 +78,72 @@ pub(crate) fn build_prompt(request: &MessagesRequest) -> String {
             "assistant" => "Assistant",
             _ => "Human",
         };
-        let content = match &msg.content {
-            MessageContent::Text(s) => s.clone(),
+        let content: Vec<ContentBlock> = match &msg.content {
+            MessageContent::Text(s) => vec![ContentBlock::Text { text: s.clone() }],
             MessageContent::Blocks(blocks) => blocks
                 .iter()
-                .filter_map(|b| match b {
-                    crate::types::ContentBlock::Text { text } => Some(text.clone()),
-                    crate::types::ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                    } => Some(format!("[tool_result for {}]: {}", tool_use_id, content)),
-                    crate::types::ContentBlock::ToolUse { id, name, input } => {
-                        Some(format!("[tool_use {} ({}): {}]", name, id, input))
-                    }
-                    crate::types::ContentBlock::Thinking { thinking } => {
-                        if thinking.is_empty() {
-                            None
-                        } else {
-                            Some(format!("<thinking>{}</thinking>", thinking))
+                .filter_map(|b| {
+                    let text = match b {
+                        ContentBlock::Image { .. } => return Some(b.clone()),
+                        ContentBlock::Text { text } => text.clone(),
+                        ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                        } => format!("[tool_result for {}]: {}", tool_use_id, content),
+                        ContentBlock::ToolUse { id, name, input } => {
+                            format!("[tool_use {} ({}): {}]", name, id, input)
                         }
-                    }
-                    _ => None,
+                        ContentBlock::Thinking { thinking } if thinking.is_empty() => return None,
+                        ContentBlock::Thinking { thinking } => {
+                            format!("<thinking>{}</thinking>", thinking)
+                        }
+                    };
+                    Some(ContentBlock::Text { text })
                 })
-                .collect::<Vec<_>>()
-                .join("\n"),
+                .collect(),
         };
         // Skip messages that would produce empty content
-        if content.trim().is_empty() {
+        if content
+            .iter()
+            .all(|b| matches!(b, ContentBlock::Text { text } if text.trim().is_empty()))
+        {
             continue;
         }
-        parts.push(format!("{}: {}", role, content));
+        push_text(&mut prompt, "\n\n", &format!("{}: ", role));
+        let mut sep = "";
+        for block in content {
+            match block {
+                ContentBlock::Text { text } => push_text(&mut prompt, sep, &text),
+                image => prompt.push(image),
+            }
+            sep = "\n";
+        }
     }
 
-    parts.join("\n\n")
+    prompt
+}
+
+/// Append `text` to the trailing text block, joined by `sep`, or start a new
+/// text block if the prompt is empty or ends with an image.
+fn push_text(prompt: &mut Vec<ContentBlock>, sep: &str, text: &str) {
+    match prompt.last_mut() {
+        Some(ContentBlock::Text { text: last }) => {
+            last.push_str(sep);
+            last.push_str(text);
+        }
+        _ => prompt.push(ContentBlock::Text {
+            text: text.to_string(),
+        }),
+    }
+}
+
+/// Build the CLI's stdin: one `--input-format stream-json` user message.
+pub(crate) fn build_stdin(request: &MessagesRequest) -> String {
+    let message = serde_json::json!({
+        "type": "user",
+        "message": {"role": "user", "content": build_prompt(request)},
+    });
+    format!("{message}\n")
 }
 
 /// Spawn the claude CLI and stream NDJSON messages back via a channel.
@@ -117,7 +154,7 @@ pub async fn spawn_stream(
     request: &MessagesRequest,
     working_dir: Option<&str>,
 ) -> Result<mpsc::Receiver<Result<CliMessage, ProxyError>>, ProxyError> {
-    let prompt = build_prompt(request);
+    let input = build_stdin(request);
     let model = map_model(&request.model);
 
     let cwd = working_dir
@@ -126,9 +163,9 @@ pub async fn spawn_stream(
         .unwrap_or_else(|| dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/")));
 
     tracing::info!(
-        "Spawning claude CLI: model={}, prompt_len={}, cwd={}",
+        "Spawning claude CLI: model={}, input_len={}, cwd={}",
         model,
-        prompt.len(),
+        input.len(),
         cwd.display()
     );
 
@@ -136,6 +173,8 @@ pub async fn spawn_stream(
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .arg("-p")
+        .arg("--input-format")
+        .arg("stream-json")
         .arg("--output-format")
         .arg("stream-json")
         .arg("--verbose")
@@ -159,9 +198,9 @@ pub async fn spawn_stream(
         .stdin
         .take()
         .ok_or_else(|| ProxyError::CliError("failed to capture stdin".to_string()))?;
-    let prompt_bytes = prompt.into_bytes();
+    let input_bytes = input.into_bytes();
     tokio::spawn(async move {
-        let _ = stdin.write_all(&prompt_bytes).await;
+        let _ = stdin.write_all(&input_bytes).await;
         let _ = stdin.shutdown().await;
     });
 
